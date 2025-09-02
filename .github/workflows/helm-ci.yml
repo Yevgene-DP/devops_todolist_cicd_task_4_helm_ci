@@ -1,0 +1,130 @@
+name: Helm CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  HELM_VERSION: '3.12.0'
+  DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/devops-todolist:${{ github.sha }}
+
+jobs:
+  docker-ci:
+    name: Docker CI
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install coverage flake8
+
+    - name: Run tests with coverage
+      run: |
+        if [ -d "tests" ]; then
+          coverage run -m pytest tests/ -v
+        else
+          echo "No tests found, skipping test execution"
+        fi
+
+    - name: Login to DockerHub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        push: true
+        tags: |
+          ${{ secrets.DOCKERHUB_USERNAME }}/devops-todolist:${{ github.sha }}
+          ${{ secrets.DOCKERHUB_USERNAME }}/devops-todolist:latest
+
+    - name: Upload Docker image info
+      run: |
+        echo "DOCKER_IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/devops-todolist:${{ github.sha }}" >> $GITHUB_ENV
+        echo "✅ Docker image: ${{ secrets.DOCKERHUB_USERNAME }}/devops-todolist:${{ github.sha }}"
+
+  helm-ci:
+    name: Helm CI
+    runs-on: ubuntu-latest
+    needs: docker-ci
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Helm
+      uses: azure/setup-helm@v3
+      with:
+        version: ${{ env.HELM_VERSION }}
+
+    - name: Download Helm charts
+      run: |
+        echo "📦 Helm charts structure:"
+        find . -name "Chart.yaml" -exec dirname {} \; | xargs -I {} ls -la {}
+        echo "----------------------------"
+
+    - name: Helm template
+      run: |
+        echo "🚀 Running helm template..."
+        if [ -f "chart/Chart.yaml" ]; then
+          helm template my-release chart/ --set image.repository=${{ secrets.DOCKERHUB_USERNAME }}/devops-todolist --set image.tag=${{ github.sha }} --debug
+        else
+          echo "No chart/Chart.yaml found, checking for other chart locations"
+          find . -name "Chart.yaml" -exec echo "Found chart: {}" \;
+        fi
+
+    - name: Helm lint
+      run: |
+        echo "🔍 Running helm lint..."
+        if [ -f "chart/Chart.yaml" ]; then
+          helm lint chart/ --set image.repository=${{ secrets.DOCKERHUB_USERNAME }}/devops-todolist --set image.tag=${{ github.sha }}
+        else
+          echo "No chart found for linting"
+          exit 0
+        fi
+
+    - name: Helm package
+      run: |
+        echo "📦 Packaging Helm chart..."
+        if [ -f "chart/Chart.yaml" ]; then
+          helm package chart/ --version ${{ github.sha }} --app-version ${{ github.sha }}
+          ls -la *.tgz
+        else
+          echo "No chart found for packaging"
+          exit 0
+        fi
+
+    - name: Upload Helm package artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: helm-chart-package
+        path: *.tgz
+        retention-days: 5
+
+    - name: Display success message
+      run: |
+        echo "✅ Helm CI completed successfully!"
+        echo "📦 Chart packaged: $(ls *.tgz 2>/dev/null || echo 'no chart found')"
+        echo "🐳 Docker image: ${{ secrets.DOCKERHUB_USERNAME }}/devops-todolist:${{ github.sha }}"
